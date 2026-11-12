@@ -81,50 +81,104 @@ std::string ExtractJsonString(const std::string& json, const std::string& key) {
     return json.substr(pos + 1, end - pos - 1);
 }
 
-// Simple helper to find and print the assistant text output from OpenAI Responses API
-// Extracts the final assistant summary from either OpenAI Responses API or Claude Messages API
-void PrintStatusSummary(const std::string& jsonResponse) {
+bool ParseJsonString(const std::string& json, size_t quotePos, std::string& value, size_t& nextPos) {
+    if (quotePos >= json.size() || json[quotePos] != '"') return false;
+
+    value.clear();
+    for (size_t i = quotePos + 1; i < json.size(); ++i) {
+        char c = json[i];
+        if (c == '"') {
+            nextPos = i + 1;
+            return true;
+        }
+        if (c != '\\') {
+            value.push_back(c);
+            continue;
+        }
+        if (++i >= json.size()) return false;
+        switch (json[i]) {
+        case '"': value.push_back('"'); break;
+        case '\\': value.push_back('\\'); break;
+        case '/': value.push_back('/'); break;
+        case 'b': value.push_back('\b'); break;
+        case 'f': value.push_back('\f'); break;
+        case 'n': value.push_back('\n'); break;
+        case 'r': value.push_back('\r'); break;
+        case 't': value.push_back('\t'); break;
+        case 'u':
+            if (i + 4 >= json.size()) return false;
+            value.append(json, i - 1, 6);
+            i += 4;
+            break;
+        default: return false;
+        }
+    }
+    return false;
+}
+
+std::string FindLastJsonStringValue(const std::string& json, const std::string& key) {
+    const std::string pattern = "\"" + key + "\"";
+    std::string result;
+    size_t searchFrom = 0;
+    size_t pos = std::string::npos;
+
+    while ((pos = json.find(pattern, searchFrom)) != std::string::npos) {
+        searchFrom = pos + pattern.size();
+
+        size_t previous = pos;
+        while (previous > 0 && std::isspace(static_cast<unsigned char>(json[previous - 1]))) --previous;
+        if (previous == 0 || (json[previous - 1] != '{' && json[previous - 1] != ',')) continue;
+
+        size_t valuePos = searchFrom;
+        while (valuePos < json.size() && std::isspace(static_cast<unsigned char>(json[valuePos]))) ++valuePos;
+        if (valuePos >= json.size() || json[valuePos] != ':') continue;
+        ++valuePos;
+        while (valuePos < json.size() && std::isspace(static_cast<unsigned char>(json[valuePos]))) ++valuePos;
+        if (valuePos >= json.size() || json[valuePos] != '"') continue;
+
+        std::string parsed;
+        size_t afterValue = 0;
+        if (ParseJsonString(json, valuePos, parsed, afterValue)) {
+            result = parsed;
+            searchFrom = afterValue;
+        }
+    }
+    return result;
+}
+
+void PrintStatusSummary(const std::string& jsonResponse, DWORD httpStatus) {
     std::cout << "\n========================================\n";
     std::cout << "          TRADING STATUS SUMMARY        \n";
     std::cout << "========================================\n";
+    std::cout << "HTTP status: " << httpStatus << "\n";
 
-    // Use rfind to grab the LAST "text": field in the JSON (the final assistant summary)
-    size_t textPos = jsonResponse.rfind("\"text\":");
-    if (textPos != std::string::npos) {
-        size_t quoteStart = jsonResponse.find('"', textPos + 7);
-        if (quoteStart != std::string::npos) {
-            quoteStart++;
-            size_t quoteEnd = quoteStart;
-            while (quoteEnd < jsonResponse.size()) {
-                if (jsonResponse[quoteEnd] == '"' && jsonResponse[quoteEnd - 1] != '\\') break;
-                quoteEnd++;
-            }
-            std::string rawText = jsonResponse.substr(quoteStart, quoteEnd - quoteStart);
-
-            // Unescape newline/quote sequences for clean console viewing
-            std::string cleanText;
-            for (size_t i = 0; i < rawText.size(); ++i) {
-                if (rawText[i] == '\\' && i + 1 < rawText.size()) {
-                    char next = rawText[i + 1];
-                    if (next == 'n') { cleanText.push_back('\n'); i++; }
-                    else if (next == 't') { cleanText.push_back('\t'); i++; }
-                    else if (next == '"') { cleanText.push_back('"'); i++; }
-                    else if (next == '\\') { cleanText.push_back('\\'); i++; }
-                    else { cleanText.push_back(rawText[i]); }
-                }
-                else {
-                    cleanText.push_back(rawText[i]);
-                }
-            }
-            std::cout << cleanText << "\n";
-            std::cout << "========================================\n";
-            return;
-        }
+    if (httpStatus == 0) {
+        std::cout << "No HTTP response was received. Check the network connection and try again.\n";
+        std::cout << "========================================\n";
+        return;
     }
 
-    // Fallback: if no "text" block exists (e.g., an API error occurred), print the raw JSON response
-    std::cout << "Could not locate final 'text' field. Raw API response:\n"
-        << jsonResponse << "\n";
+    const std::string responseStatus = FindLastJsonStringValue(jsonResponse, "status");
+    if (!responseStatus.empty()) {
+        std::cout << "Response status: " << responseStatus << "\n";
+    }
+
+    if (httpStatus < 200 || httpStatus >= 300) {
+        const std::string errorMessage = FindLastJsonStringValue(jsonResponse, "message");
+        std::cout << "Provider request failed";
+        if (!errorMessage.empty()) std::cout << ": " << errorMessage;
+        std::cout << "\n========================================\n";
+        return;
+    }
+
+    const std::string summary = FindLastJsonStringValue(jsonResponse, "text");
+    if (summary.empty()) {
+        std::cout << "No assistant text was found in the response. Check the response status and provider tool configuration.\n";
+        std::cout << "========================================\n";
+        return;
+    }
+
+    std::cout << summary << "\n";
     std::cout << "========================================\n";
 }
 
@@ -170,7 +224,7 @@ std::string HttpRequest(const std::wstring& host, const std::wstring& path,
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return "";
-    WinHttpSetTimeouts(hSession, 10000, 10000, 30000, 180000); // 3 min timeout for reasoning models
+    WinHttpSetTimeouts(hSession, 10000, 10000, 30000, 280000); // 3 min timeout for reasoning models
 
     HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
     HINTERNET hRequest = WinHttpOpenRequest(hConnect, method.c_str(), path.c_str(),
@@ -427,11 +481,11 @@ DWORD CallOpenAITrader(const std::string& openaiKey, const std::string& rhAccess
         L"Authorization: Bearer " + ToWide(openaiKey) + L"\r\n";
 
     DWORD status = 0;
-    std::cout << "Running OpenAI Agent with Robinhood MCP (gpt-6-luna)...\n";
+    std::cout << "Running OpenAI Agent with Robinhood MCP (gpt-6-luna)...\n"
+        << "Waiting for the provider and MCP tools to finish...\n" << std::flush;
     std::string resp = HttpRequest(L"api.openai.com", L"/v1/responses", L"POST", headers, payload, &status);
 
-    // Print Status Summary neatly at the bottom of the output
-    PrintStatusSummary(resp);
+    PrintStatusSummary(resp, status);
 
     return status;
 }
@@ -476,10 +530,11 @@ DWORD CallClaudeTrader(const std::string& claudeKey, const std::string& rhAccess
         L"anthropic-beta: mcp-client-2025-11-20\r\n";
 
     DWORD status = 0;
-    std::cout << "Running Claude with Robinhood MCP (claude-sonnet-4-5)...\n";
+    std::cout << "Running Claude with Robinhood MCP (claude-sonnet-4-5)...\n"
+        << "Waiting for the provider and MCP tools to finish...\n" << std::flush;
     std::string response = HttpRequest(L"api.anthropic.com", L"/v1/messages", L"POST",
         headers, payload, &status);
-    PrintStatusSummary(response);
+    PrintStatusSummary(response, status);
     return status;
 }
 int main(int argc, char* argv[]) {
