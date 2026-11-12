@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="RobinhoodAutomation/RobinhoodAutomation.vcxproj" />
+  <Project Path="RobinhoodAutomation/RobinhoodAutomation.vcxproj" Id="6053f617-e945-4228-847e-7364e44d9f1d" />
 </Solution>

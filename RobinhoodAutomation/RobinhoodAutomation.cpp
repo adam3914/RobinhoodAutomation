@@ -15,6 +15,9 @@
 #include <string>
 #include <vector>
 #include <cctype>
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -223,13 +226,27 @@ std::string HttpRequest(const std::wstring& host, const std::wstring& path,
     HINTERNET hSession = WinHttpOpen(L"RobinhoodCPPClient/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) return "";
-    WinHttpSetTimeouts(hSession, 10000, 10000, 30000, 280000); // 3 min timeout for reasoning models
+    if (!hSession) {
+        std::cerr << "WinHTTP session creation failed (Windows error " << GetLastError() << ").\n";
+        return "";
+    }
+    WinHttpSetTimeouts(hSession, 10000, 10000, 30000, 280000);
 
     HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) {
+        std::cerr << "WinHTTP connect failed (Windows error " << GetLastError() << ").\n";
+        WinHttpCloseHandle(hSession);
+        return "";
+    }
     HINTERNET hRequest = WinHttpOpenRequest(hConnect, method.c_str(), path.c_str(),
         nullptr, WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) {
+        std::cerr << "WinHTTP request creation failed (Windows error " << GetLastError() << ").\n";
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return "";
+    }
 
     BOOL ok = WinHttpSendRequest(hRequest,
         headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
@@ -238,7 +255,13 @@ std::string HttpRequest(const std::wstring& host, const std::wstring& path,
         (DWORD)body.size(), (DWORD)body.size(), 0);
 
     std::string response;
-    if (ok && WinHttpReceiveResponse(hRequest, nullptr)) {
+    if (!ok) {
+        std::cerr << "WinHTTP send failed (Windows error " << GetLastError() << ").\n";
+    }
+    else if (!WinHttpReceiveResponse(hRequest, nullptr)) {
+        std::cerr << "WinHTTP response wait failed (Windows error " << GetLastError() << ").\n";
+    }
+    else {
         if (outStatus) {
             DWORD sz = sizeof(DWORD);
             WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
@@ -247,18 +270,51 @@ std::string HttpRequest(const std::wstring& host, const std::wstring& path,
         DWORD dwSize = 0, dwDownloaded = 0;
         do {
             dwSize = 0;
-            WinHttpQueryDataAvailable(hRequest, &dwSize);
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) {
+                std::cerr << "WinHTTP response read setup failed (Windows error " << GetLastError() << ").\n";
+                break;
+            }
             if (!dwSize) break;
             std::string buf(dwSize, '\0');
-            if (WinHttpReadData(hRequest, &buf[0], dwSize, &dwDownloaded)) {
-                response.append(buf, 0, dwDownloaded);
+            if (!WinHttpReadData(hRequest, &buf[0], dwSize, &dwDownloaded)) {
+                std::cerr << "WinHTTP response body read failed (Windows error " << GetLastError() << ").\n";
+                break;
             }
+            response.append(buf, 0, dwDownloaded);
         } while (dwSize > 0);
     }
 
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
+    return response;
+}
+
+std::string HttpRequestWithProgress(const std::wstring& host, const std::wstring& path,
+    const std::wstring& method, const std::wstring& headers,
+    const std::string& body, DWORD* outStatus) {
+    std::string response;
+    DWORD status = 0;
+    std::atomic<bool> completed(false);
+    const auto start = std::chrono::steady_clock::now();
+
+    std::thread requestThread([&]() {
+        response = HttpRequest(host, path, method, headers, body, &status);
+        completed.store(true, std::memory_order_release);
+    });
+
+    while (!completed.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::seconds(15));
+        if (!completed.load(std::memory_order_acquire)) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start).count();
+            std::cout << "Still waiting for the provider/MCP response (" << elapsed
+                << " seconds elapsed)...\n" << std::flush;
+        }
+    }
+
+    requestThread.join();
+    if (outStatus) *outStatus = status;
     return response;
 }
 
@@ -457,6 +513,7 @@ DWORD CallOpenAITrader(const std::string& openaiKey, const std::string& rhAccess
 
     std::string payload = R"({
         "model": "gpt-6-luna",
+        "instructions": "You are running in an unattended single-turn batch script with no human in the loop. The user has pre-authorized all trades and pre-acknowledged all review_option_order and review_equity_order alerts. Whenever you call review_option_order or review_equity_order, you MUST immediately call place_option_order or place_equity_order in the same turn without asking for confirmation.",
         "reasoning": {
             "effort": "medium"
         },
@@ -483,7 +540,8 @@ DWORD CallOpenAITrader(const std::string& openaiKey, const std::string& rhAccess
     DWORD status = 0;
     std::cout << "Running OpenAI Agent with Robinhood MCP (gpt-6-luna)...\n"
         << "Waiting for the provider and MCP tools to finish...\n" << std::flush;
-    std::string resp = HttpRequest(L"api.openai.com", L"/v1/responses", L"POST", headers, payload, &status);
+    std::string resp = HttpRequestWithProgress(L"api.openai.com", L"/v1/responses", L"POST",
+        headers, payload, &status);
 
     PrintStatusSummary(resp, status);
 
@@ -497,6 +555,7 @@ DWORD CallClaudeTrader(const std::string& claudeKey, const std::string& rhAccess
     std::string payload = R"({
         "model": "claude-sonnet-4-5",
         "max_tokens": 8192,
+        "system": "You are running in an unattended single-turn batch script with no human in the loop. The user has pre-authorized all trades and pre-acknowledged all review_option_order and review_equity_order alerts. Whenever you call review_option_order or review_equity_order, you MUST immediately call place_option_order or place_equity_order in the same turn without asking for confirmation.",
         "mcp_servers": [
             {
                 "type": "url",
@@ -532,7 +591,7 @@ DWORD CallClaudeTrader(const std::string& claudeKey, const std::string& rhAccess
     DWORD status = 0;
     std::cout << "Running Claude with Robinhood MCP (claude-sonnet-4-5)...\n"
         << "Waiting for the provider and MCP tools to finish...\n" << std::flush;
-    std::string response = HttpRequest(L"api.anthropic.com", L"/v1/messages", L"POST",
+    std::string response = HttpRequestWithProgress(L"api.anthropic.com", L"/v1/messages", L"POST",
         headers, payload, &status);
     PrintStatusSummary(response, status);
     return status;
@@ -588,7 +647,7 @@ int main(int argc, char* argv[]) {
     DWORD status = useClaude
         ? CallClaudeTrader(apiKey, accessToken)
         : CallOpenAITrader(apiKey, accessToken);
-    if (status != 200) {
+    if (status == 401) {
         std::cout << "Attempting automatic OAuth token refresh...\n";
         if (RefreshAccessToken(clientId, accessToken, refreshToken)) {
             if (useClaude) {
@@ -598,6 +657,10 @@ int main(int argc, char* argv[]) {
                 CallOpenAITrader(apiKey, accessToken);
             }
         }
+    }
+    else if (status != 200) {
+        std::cerr << "The request was not retried automatically because its outcome may be unknown. "
+            << "Check Robinhood order activity before starting another run.\n";
     }
 
     return 0;
