@@ -82,13 +82,14 @@ std::string ExtractJsonString(const std::string& json, const std::string& key) {
 }
 
 // Simple helper to find and print the assistant text output from OpenAI Responses API
+// Extracts the final assistant summary from either OpenAI Responses API or Claude Messages API
 void PrintStatusSummary(const std::string& jsonResponse) {
     std::cout << "\n========================================\n";
     std::cout << "          TRADING STATUS SUMMARY        \n";
     std::cout << "========================================\n";
 
-    // Search for the "text" field inside the output blocks
-    size_t textPos = jsonResponse.find("\"text\":");
+    // Use rfind to grab the LAST "text": field in the JSON (the final assistant summary)
+    size_t textPos = jsonResponse.rfind("\"text\":");
     if (textPos != std::string::npos) {
         size_t quoteStart = jsonResponse.find('"', textPos + 7);
         if (quoteStart != std::string::npos) {
@@ -100,7 +101,7 @@ void PrintStatusSummary(const std::string& jsonResponse) {
             }
             std::string rawText = jsonResponse.substr(quoteStart, quoteEnd - quoteStart);
 
-            // Unescape basic newline/quote sequences for clean console viewing
+            // Unescape newline/quote sequences for clean console viewing
             std::string cleanText;
             for (size_t i = 0; i < rawText.size(); ++i) {
                 if (rawText[i] == '\\' && i + 1 < rawText.size()) {
@@ -121,8 +122,9 @@ void PrintStatusSummary(const std::string& jsonResponse) {
         }
     }
 
-    // Fallback if parsing fails
-    std::cout << "Status: Request completed, but text extraction could not locate output message.\n";
+    // Fallback: if no "text" block exists (e.g., an API error occurred), print the raw JSON response
+    std::cout << "Could not locate final 'text' field. Raw API response:\n"
+        << jsonResponse << "\n";
     std::cout << "========================================\n";
 }
 
@@ -406,6 +408,9 @@ DWORD CallOpenAITrader(const std::string& openaiKey, const std::string& rhAccess
         },
         "tools": [
             {
+                "type": "web_search"
+            },
+            {
                 "type": "mcp",
                 "server_label": "robinhood_trading",
                 "server_url": "https://agent.robinhood.com/mcp/trading",
@@ -437,13 +442,24 @@ DWORD CallClaudeTrader(const std::string& claudeKey, const std::string& rhAccess
 
     std::string payload = R"({
         "model": "claude-sonnet-4-5",
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "mcp_servers": [
             {
                 "type": "url",
                 "url": "https://agent.robinhood.com/mcp/trading",
                 "name": "robinhood_trading",
                 "authorization_token": ")" + token + R"("
+            }
+        ],
+        "tools": [
+            {
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 5
+            },
+            {
+                "type": "mcp_toolset",
+                "mcp_server_name": "robinhood_trading"
             }
         ],
         "messages": [
@@ -457,7 +473,7 @@ DWORD CallClaudeTrader(const std::string& claudeKey, const std::string& rhAccess
     std::wstring headers = L"Content-Type: application/json\r\n"
         L"x-api-key: " + ToWide(claudeKey) + L"\r\n"
         L"anthropic-version: 2023-06-01\r\n"
-        L"anthropic-beta: mcp-client-2025-04-04\r\n";
+        L"anthropic-beta: mcp-client-2025-11-20\r\n";
 
     DWORD status = 0;
     std::cout << "Running Claude with Robinhood MCP (claude-sonnet-4-5)...\n";
@@ -466,7 +482,6 @@ DWORD CallClaudeTrader(const std::string& claudeKey, const std::string& rhAccess
     PrintStatusSummary(response);
     return status;
 }
-
 int main(int argc, char* argv[]) {
     std::string provider = "openai";
     for (int i = 1; i < argc; ++i) {
